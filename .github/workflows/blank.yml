@@ -1,0 +1,286 @@
+name: PC Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: 'Quantos minutos ligado (máx. 330)'
+        required: true
+        default: '300'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  pc:
+    runs-on: windows-latest
+    timeout-minutes: 355
+    steps:
+      - name: Conferir a chave do Tailscale
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_KEY)) {
+            Write-Host "::error::O secret TAILSSCALE_AUTH_KEY esta VAZIO ou com nome errado"
+            exit 1
+          }
+          Write-Host "Chave encontrada. Tamanho: $($env:TS_KEY.Length)"
+
+      - name: Criar pastas
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'C:\Dados\Firefox','C:\Dados\sistema','C:\Cache' | Out-Null
+
+      - name: Restaurar backup
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\Cache
+          key: dados-${{ github.run_id }}
+          restore-keys: |
+            dados-
+
+      - name: Descompactar backup
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\Cache\dados.7z') {
+            & "C:\Program Files\7-Zip\7z.exe" x 'C:\Cache\dados.7z' -o'C:\Dados' -y | Out-Null
+            Write-Host "Dados restaurados"
+          } else {
+            Write-Host "Nenhum backup anterior (primeira vez)"
+          }
+          exit 0
+
+      # IP FIXO: restaura a identidade salva do Tailscale (mesma maquina = mesmo IP)
+      - name: Instalar e conectar no Tailscale (mesmo IP)
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSSCALE_AUTH_KEY }}
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\tailscale.msi","/quiet","/norestart" -Wait
+          Start-Sleep -Seconds 10
+
+          $salvo1 = 'C:\Dados\sistema\ts1'
+          $salvo2 = 'C:\Dados\sistema\ts2'
+          if (Test-Path $salvo1) {
+            Write-Host "Restaurando identidade salva do Tailscale"
+            Stop-Service Tailscale -Force
+            Start-Sleep -Seconds 3
+            robocopy $salvo1 'C:\ProgramData\Tailscale' /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if (Test-Path $salvo2) {
+              New-Item -ItemType Directory -Force -Path 'C:\Windows\System32\config\systemprofile\AppData\Local\Tailscale' | Out-Null
+              robocopy $salvo2 'C:\Windows\System32\config\systemprofile\AppData\Local\Tailscale' /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            }
+            Start-Service Tailscale
+            Start-Sleep -Seconds 8
+            & $ts up --unattended --hostname=pc-windows --reset --timeout=30s
+          }
+
+          $ip = ((& $ts ip -4 2>&1) | Out-String).Trim()
+          if ($ip -notmatch '^100\.') {
+            Write-Host "Entrando com a chave (primeira vez ou identidade perdida -> IP novo)"
+            & $ts up --auth-key="$($env:TS_KEY.Trim())" --hostname=pc-windows --unattended --reset
+          }
+          Write-Host "IP do Tailscale: $((& $ts ip -4 2>&1) | Out-String)"
+          exit 0
+
+      - name: Preparar Firefox e atalhos
+        shell: pwsh
+        run: |
+          $ff = "C:\Program Files\Mozilla Firefox\firefox.exe"
+          if (-not (Test-Path $ff)) { choco install firefox -y --no-progress }
+          $w = New-Object -ComObject WScript.Shell
+          $s = $w.CreateShortcut("C:\Users\Public\Desktop\Firefox Salvo.lnk")
+          $s.TargetPath = $ff
+          $s.Arguments = '-profile C:\Dados\Firefox -no-remote'
+          $s.Save()
+          $e = $w.CreateShortcut("C:\Users\Public\Desktop\Salvar e Encerrar.lnk")
+          $e.TargetPath = "C:\Windows\System32\cmd.exe"
+          $e.Arguments = '/c type nul > C:\parar.txt'
+          $e.Save()
+          # lista base de programas (para saber depois o que VOCE instalou)
+          Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Directory | ForEach-Object Name | Set-Content 'C:\baseline-choco.txt'
+          exit 0
+
+      - name: Criar usuario e restaurar perfil (navegadores, arquivos, configs)
+        shell: pwsh
+        run: |
+          net user jogador "Pc@Game2026!" /add
+          net localgroup Administrators jogador /add
+          net localgroup "Remote Desktop Users" jogador /add
+
+          # cria a pasta do perfil ANTES de restaurar (senao o Windows cria jogador.NOMEDOPC)
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public static class PerfilNativo {
+            [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
+            public static extern int CreateProfile(string pszUserSid, string pszUserName, StringBuilder pszProfilePath, uint cchProfilePath);
+          }
+          "@
+          $sid = (New-Object System.Security.Principal.NTAccount('jogador')).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          $sb = New-Object System.Text.StringBuilder 260
+          $r = [PerfilNativo]::CreateProfile($sid, 'jogador', $sb, 260)
+          Write-Host "CreateProfile: $r -> $($sb.ToString())"
+
+          if (Test-Path 'C:\Cache\perfil.7z') {
+            & "C:\Program Files\7-Zip\7z.exe" x 'C:\Cache\perfil.7z' -o'C:\Users\jogador' -y | Out-Null
+            Write-Host "Perfil restaurado"
+          }
+
+          # restaura configuracoes do registro do usuario (HKCU)
+          $hive = 'C:\Dados\sistema\hkcu.hiv'
+          if (Test-Path $hive) {
+            reg load HKU\NovoPerfil 'C:\Users\jogador\NTUSER.DAT' | Out-Null
+            reg load HKU\AntigoPerfil $hive | Out-Null
+            foreach ($k in 'Software','Environment','Control Panel') {
+              reg copy "HKU\AntigoPerfil\$k" "HKU\NovoPerfil\$k" /s /f | Out-Null
+            }
+            [gc]::Collect()
+            Start-Sleep -Seconds 2
+            reg unload HKU\AntigoPerfil | Out-Null
+            reg unload HKU\NovoPerfil | Out-Null
+            Write-Host "Registro do usuario restaurado"
+          }
+          exit 0
+
+      - name: Reinstalar programas que voce instalou antes
+        shell: pwsh
+        run: |
+          $lista = 'C:\Dados\sistema\choco-extras.txt'
+          if (Test-Path $lista) {
+            foreach ($p in (Get-Content $lista | Where-Object { $_.Trim() })) {
+              Write-Host "Reinstalando $p"
+              choco install $p -y --no-progress
+            }
+          }
+          exit 0
+
+      - name: Ativar Área de Trabalho Remota
+        shell: pwsh
+        run: |
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+          New-NetFirewallRule -DisplayName "RDP Liberado" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any
+          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host "CONECTE EM: $ip  usuario: jogador  senha: Pc@Game2026!"
+
+      - name: Manter ativa
+        timeout-minutes: 340
+        shell: pwsh
+        env:
+          MIN: ${{ inputs.minutos }}
+        run: |
+          $m = [int]$env:MIN
+          if ($m -gt 330) { $m = 330 }
+          $limite = (Get-Date).AddMinutes($m)
+          Write-Host "Vai encerrar e salvar sozinho as $($limite.ToString('HH:mm')) (horario da maquina)"
+          while (-not (Test-Path 'C:\parar.txt') -and (Get-Date) -lt $limite) { Start-Sleep -Seconds 30 }
+
+      # ---------------- SALVAR TUDO ----------------
+
+      - name: Salvar registro e fechar sessao (fecha navegadores direito)
+        if: always()
+        shell: pwsh
+        run: |
+          try {
+            $sid = (New-Object System.Security.Principal.NTAccount('jogador')).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          } catch { $sid = $null }
+          if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) {
+            reg save "HKU\$sid" 'C:\Dados\sistema\hkcu.hiv' /y | Out-Null
+            Write-Host "Registro do usuario salvo"
+          }
+
+          # logoff pede para os programas fecharem e gravarem tudo
+          foreach ($l in (quser 2>$null)) {
+            if ($l -match 'jogador') {
+              $partes = ($l -replace '^[\s>]+','') -split '\s+'
+              $id = $partes | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1
+              if ($id) { logoff $id }
+            }
+          }
+          for ($i = 0; $i -lt 20; $i++) {
+            if (-not (quser 2>$null | Select-String 'jogador')) { break }
+            Start-Sleep -Seconds 3
+          }
+          Get-Process firefox,chrome,msedge -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          exit 0
+
+      - name: Salvar identidade do Tailscale e lista de programas
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $ip = ((& $ts ip -4 2>&1) | Out-String).Trim()
+
+          # lista de programas instalados via choco por voce (alem dos da maquina)
+          if (Test-Path 'C:\baseline-choco.txt') {
+            $base = Get-Content 'C:\baseline-choco.txt'
+            Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Directory | ForEach-Object Name |
+              Where-Object { $_ -notin $base } | Set-Content 'C:\Dados\sistema\choco-extras.txt'
+          }
+
+          # so salva a identidade se o Tailscale estava conectado (nao estraga o backup bom)
+          if ($ip -match '^100\.') {
+            Stop-Service Tailscale -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            robocopy 'C:\ProgramData\Tailscale' 'C:\Dados\sistema\ts1' /MIR /XD Logs /NFL /NDL /NJH /NJS /NP | Out-Null
+            $p2 = 'C:\Windows\System32\config\systemprofile\AppData\Local\Tailscale'
+            if (Test-Path $p2) {
+              robocopy $p2 'C:\Dados\sistema\ts2' /MIR /XD Logs /NFL /NDL /NJH /NJS /NP | Out-Null
+            }
+            Write-Host "Identidade do Tailscale salva (IP $ip)"
+          } else {
+            Write-Host "Tailscale nao estava conectado - mantendo a identidade antiga"
+          }
+          exit 0
+
+      - name: Compactar backup
+        if: always()
+        shell: pwsh
+        run: |
+          $z = "C:\Program Files\7-Zip\7z.exe"
+          Remove-Item 'C:\Cache\dados.7z','C:\Cache\perfil.7z' -ErrorAction SilentlyContinue
+
+          & $z a 'C:\Cache\dados.7z' 'C:\Dados\*' -mx=1 -mmt=on -ssw -y | Out-Null
+
+          if (Test-Path 'C:\Users\jogador') {
+            & $z a 'C:\Cache\perfil.7z' 'C:\Users\jogador\*' -mx=1 -mmt=on -ssw -y `
+              '-xr!Cache' '-xr!Code Cache' '-xr!GPUCache' '-xr!CacheStorage' '-xr!Crashpad' `
+              '-xr!Temp' '-xr!INetCache' '-xr!WebCache' '-xr!ntuser.*' '-xr!UsrClass.dat*' | Out-Null
+          }
+
+          $gb = (Get-ChildItem 'C:\Cache' -File | Measure-Object Length -Sum).Sum / 1GB
+          Write-Host ("Tamanho do backup: {0:N2} GB (limite do cache do GitHub: 10 GB)" -f $gb)
+          if ($gb -gt 9.5) {
+            Write-Host "::warning::Backup perto/acima de 10 GB. O GitHub pode recusar salvar. Apague arquivos grandes (Downloads, jogos)."
+          }
+          exit 0
+
+      - name: Salvar backup
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\Cache
+          key: dados-${{ github.run_id }}
+
+      - name: Apagar backups antigos (libera espaco)
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHAVE_ATUAL: dados-${{ github.run_id }}
+        run: |
+          $lista = gh cache list --key dados- --limit 100 --json id,key | ConvertFrom-Json
+          foreach ($c in $lista) {
+            if ($c.key -ne $env:CHAVE_ATUAL) { gh cache delete $c.id }
+          }
+          exit 0
